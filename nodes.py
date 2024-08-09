@@ -44,7 +44,7 @@ class DownloadAndLoadCogVideoModel:
 
         base_path = os.path.join(folder_paths.models_dir, "CogVideo", "CogVideo2B")
         if not os.path.exists(base_path) and os.path.exists("/stable-diffusion-cache/models/CogVideo"):
-            base_path = "/stable-diffusion-cache/models/CogVideo"
+            base_path = "/stable-diffusion-cache/models/CogVideo/CogVideo2B"
 
         if not os.path.exists(base_path):
             log.info(f"Downloading model to: {base_path}")
