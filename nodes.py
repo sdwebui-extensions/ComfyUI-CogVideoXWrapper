@@ -6,10 +6,13 @@ from comfy.utils import ProgressBar
 from diffusers.schedulers import CogVideoXDDIMScheduler, CogVideoXDPMScheduler
 from diffusers.models import AutoencoderKLCogVideoX, CogVideoXTransformer3DModel
 from .pipeline_cogvideox import CogVideoXPipeline
+from contextlib import nullcontext
+
 
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
+
 
 class DownloadAndLoadCogVideoModel:
     @classmethod
@@ -29,7 +32,7 @@ class DownloadAndLoadCogVideoModel:
                     {"default": "bf16", "tooltip": "official recommendation is that 2b model should be fp16, 5b model should be bf16"}
                 ),
                 "fp8_transformer": ("BOOLEAN", {"default": False, "tooltip": "cast the transformer to torch.float8_e4m3fn"}),
-                "torch_compile": ("BOOLEAN", {"default": False, "tooltip": "use torch.compile to speed up inference, Linux only"}),
+                "compile": (["disabled","onediff","torch"], {"tooltip": "compile the model for faster inference, these are advanced options only available on Linux, see readme for more info"}),
             }
         }
 
@@ -38,7 +41,7 @@ class DownloadAndLoadCogVideoModel:
     FUNCTION = "loadmodel"
     CATEGORY = "CogVideoWrapper"
 
-    def loadmodel(self, model, precision, fp8_transformer, torch_compile):
+    def loadmodel(self, model, precision, fp8_transformer, compile="disabled"):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         mm.soft_empty_cache()
@@ -74,15 +77,27 @@ class DownloadAndLoadCogVideoModel:
 
         pipe = CogVideoXPipeline(vae, transformer, scheduler)
 
-        if torch_compile:
+        if compile == "torch":
             torch._dynamo.config.suppress_errors = True
-            pipe.transformer.to(device).to(memory_format=torch.channels_last)
+            pipe.transformer.to(memory_format=torch.channels_last)
             pipe.transformer = torch.compile(pipe.transformer, mode="max-autotune", fullgraph=True)
+        elif compile == "onediff":
+            from onediffx import compile_pipe
+            options = None
+            pipe = compile_pipe(
+            pipe,
+            backend="nexfort",
+            options=options,
+            ignores=["vae"],
+            fuse_qkv_projections=True,
+            )
+
 
         pipeline = {
             "pipe": pipe,
             "dtype": dtype,
-            "base_path": base_path
+            "base_path": base_path,
+            "onediff": True if compile == "onediff" else False
         }
 
         return (pipeline,)
@@ -158,6 +173,9 @@ class CogVideoImageEncode:
             "pipeline": ("COGVIDEOPIPE",),
             "image": ("IMAGE", ),
             },
+            "optional": {
+                "chunk_size": ("INT", {"default": 16, "min": 1}),
+            },
         }
 
     RETURN_TYPES = ("LATENT",)
@@ -165,7 +183,7 @@ class CogVideoImageEncode:
     FUNCTION = "encode"
     CATEGORY = "CogVideoWrapper"
 
-    def encode(self, pipeline, image):
+    def encode(self, pipeline, image, chunk_size=16):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         generator = torch.Generator(device=device).manual_seed(0)
@@ -176,7 +194,7 @@ class CogVideoImageEncode:
         input_image = input_image.to(vae.dtype).to(device)
         input_image = input_image.unsqueeze(0).permute(0, 4, 1, 2, 3) # B, C, T, H, W
         B, C, T, H, W = input_image.shape
-        chunk_size = 16
+
         latents_list = []
         # Loop through the temporal dimension in chunks of 16
         for i in range(0, T, chunk_size):
@@ -257,7 +275,10 @@ class CogVideoSampler:
             pipe.scheduler = CogVideoXDDIMScheduler.from_pretrained(base_path, subfolder="scheduler")
         elif scheduler == "DPM":
             pipe.scheduler = CogVideoXDPMScheduler.from_pretrained(base_path, subfolder="scheduler")
-        with torch.autocast(mm.get_autocast_device(device)):
+
+        autocastcondition = not pipeline["onediff"]
+        autocast_context = torch.autocast(mm.get_autocast_device(device)) if autocastcondition else nullcontext()
+        with autocast_context:
             latents = pipeline["pipe"](
                 num_inference_steps=steps,
                 height = height,
