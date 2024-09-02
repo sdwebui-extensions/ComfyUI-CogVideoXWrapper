@@ -31,8 +31,9 @@ class DownloadAndLoadCogVideoModel:
                 "precision": (["fp16", "fp32", "bf16"],
                     {"default": "bf16", "tooltip": "official recommendation is that 2b model should be fp16, 5b model should be bf16"}
                 ),
-                "fp8_transformer": ("BOOLEAN", {"default": False, "tooltip": "cast the transformer to torch.float8_e4m3fn"}),
+                "fp8_transformer": (['disabled', 'enabled', 'fastmode'], {"default": 'disabled', "tooltip": "enabled casts the transformer to torch.float8_e4m3fn, fastmode is only for latest nvidia GPUs"}),
                 "compile": (["disabled","onediff","torch"], {"tooltip": "compile the model for faster inference, these are advanced options only available on Linux, see readme for more info"}),
+                "enable_sequential_cpu_offload": ("BOOLEAN", {"default": False, "tooltip": "significantly reducing memory usage and slows down the inference"}),
             }
         }
 
@@ -41,13 +42,13 @@ class DownloadAndLoadCogVideoModel:
     FUNCTION = "loadmodel"
     CATEGORY = "CogVideoWrapper"
 
-    def loadmodel(self, model, precision, fp8_transformer, compile="disabled"):
+    def loadmodel(self, model, precision, fp8_transformer="disabled", compile="disabled", enable_sequential_cpu_offload=False):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         mm.soft_empty_cache()
 
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
-        if fp8_transformer:
+        if fp8_transformer != "disabled":
             transformer_dtype = torch.float8_e4m3fn
         else:
             transformer_dtype = dtype
@@ -72,10 +73,16 @@ class DownloadAndLoadCogVideoModel:
                 local_dir_use_symlinks=False,
             )
         transformer = CogVideoXTransformer3DModel.from_pretrained(base_path, subfolder="transformer").to(transformer_dtype).to(offload_device)
+        if fp8_transformer == "fastmode":
+            from .fp8_optimization import convert_fp8_linear
+            convert_fp8_linear(transformer, dtype)
         vae = AutoencoderKLCogVideoX.from_pretrained(base_path, subfolder="vae").to(dtype).to(offload_device)
+        
         scheduler = CogVideoXDDIMScheduler.from_pretrained(base_path, subfolder="scheduler")
 
         pipe = CogVideoXPipeline(vae, transformer, scheduler)
+        if enable_sequential_cpu_offload:
+            pipe.enable_sequential_cpu_offload()
 
         if compile == "torch":
             torch._dynamo.config.suppress_errors = True
@@ -92,12 +99,14 @@ class DownloadAndLoadCogVideoModel:
             fuse_qkv_projections=True,
             )
 
+        
 
         pipeline = {
             "pipe": pipe,
             "dtype": dtype,
             "base_path": base_path,
-            "onediff": True if compile == "onediff" else False
+            "onediff": True if compile == "onediff" else False,
+            "cpu_offloading": enable_sequential_cpu_offload
         }
 
         return (pipeline,)
@@ -175,6 +184,8 @@ class CogVideoImageEncode:
             },
             "optional": {
                 "chunk_size": ("INT", {"default": 16, "min": 1}),
+                "enable_vae_slicing": ("BOOLEAN", {"default": True, "tooltip": "VAE will split the input tensor in slices to compute decoding in several steps. This is useful to save some memory and allow larger batch sizes."}),
+                "mask": ("MASK", ),
             },
         }
 
@@ -183,14 +194,33 @@ class CogVideoImageEncode:
     FUNCTION = "encode"
     CATEGORY = "CogVideoWrapper"
 
-    def encode(self, pipeline, image, chunk_size=16):
+    def encode(self, pipeline, image, chunk_size=8, enable_vae_slicing=True, mask=None):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         generator = torch.Generator(device=device).manual_seed(0)
+
+        B, H, W, C = image.shape
+
         vae = pipeline["pipe"].vae
-        vae.to(device)
-  
-        input_image = image.clone() * 2.0 - 1.0
+        
+        if enable_vae_slicing:
+            vae.enable_slicing()
+        else:
+            vae.disable_slicing()
+
+        if not pipeline["cpu_offloading"]:
+            vae.to(device)
+        
+        input_image = image.clone()
+        if mask is not None:
+            pipeline["pipe"].original_mask = mask
+            # print(mask.shape)
+            # mask = mask.repeat(B, 1, 1)  # Shape: [B, H, W]
+            # mask = mask.unsqueeze(-1).repeat(1, 1, 1, C)
+            # print(mask.shape)
+            # input_image = input_image * (1 -mask)
+            
+        input_image = input_image * 2.0 - 1.0
         input_image = input_image.to(vae.dtype).to(device)
         input_image = input_image.unsqueeze(0).permute(0, 4, 1, 2, 3) # B, C, T, H, W
         B, C, T, H, W = input_image.shape
@@ -220,8 +250,8 @@ class CogVideoImageEncode:
         # Concatenate all the chunks along the temporal dimension
         final_latents = torch.cat(latents_list, dim=1)
         print("final latents: ", final_latents.shape)
-        
-        vae.to(offload_device)
+        if not pipeline["cpu_offloading"]:
+            vae.to(offload_device)
         
         return ({"samples": final_latents}, )
 
@@ -268,13 +298,19 @@ class CogVideoSampler:
         dtype = pipeline["dtype"]
         base_path = pipeline["base_path"]
         
-        pipe.transformer.to(device)
+        if not pipeline["cpu_offloading"]:
+            pipe.transformer.to(device)
         generator = torch.Generator(device=device).manual_seed(seed)
 
         if scheduler == "DDIM":
             pipe.scheduler = CogVideoXDDIMScheduler.from_pretrained(base_path, subfolder="scheduler")
         elif scheduler == "DPM":
             pipe.scheduler = CogVideoXDPMScheduler.from_pretrained(base_path, subfolder="scheduler")
+
+        if negative.shape[1] < positive.shape[1]:
+            target_length = positive.shape[1]
+            padding = torch.zeros((negative.shape[0], target_length - negative.shape[1], negative.shape[2]), device=negative.device)
+            negative = torch.cat((negative, padding), dim=1)
 
         autocastcondition = not pipeline["onediff"]
         autocast_context = torch.autocast(mm.get_autocast_device(device)) if autocastcondition else nullcontext()
@@ -294,7 +330,8 @@ class CogVideoSampler:
                 generator=generator,
                 device=device
             )
-        pipe.transformer.to(offload_device)
+        if not pipeline["cpu_offloading"]:
+            pipe.transformer.to(offload_device)
         mm.soft_empty_cache()
         print(latents.shape)
 
@@ -306,13 +343,14 @@ class CogVideoDecode:
         return {"required": {
             "pipeline": ("COGVIDEOPIPE",),
             "samples": ("LATENT", ),
-            "enable_vae_tiling": ("BOOLEAN", {"default": False}),
+            "enable_vae_tiling": ("BOOLEAN", {"default": False, "tooltip": "Drastically reduces memory use but may introduce seams"}),
             },
             "optional": {
             "tile_sample_min_height": ("INT", {"default": 96, "min": 16, "max": 2048, "step": 8}),
             "tile_sample_min_width": ("INT", {"default": 96, "min": 16, "max": 2048, "step": 8}),
             "tile_overlap_factor_height": ("FLOAT", {"default": 0.083, "min": 0.0, "max": 1.0, "step": 0.001}),
             "tile_overlap_factor_width": ("FLOAT", {"default": 0.083, "min": 0.0, "max": 1.0, "step": 0.001}),
+            "enable_vae_slicing": ("BOOLEAN", {"default": True, "tooltip": "VAE will split the input tensor in slices to compute decoding in several steps. This is useful to save some memory and allow larger batch sizes."}),
             }
         }
 
@@ -321,12 +359,17 @@ class CogVideoDecode:
     FUNCTION = "decode"
     CATEGORY = "CogVideoWrapper"
 
-    def decode(self, pipeline, samples, enable_vae_tiling, tile_sample_min_height, tile_sample_min_width, tile_overlap_factor_height, tile_overlap_factor_width):
+    def decode(self, pipeline, samples, enable_vae_tiling, tile_sample_min_height, tile_sample_min_width, tile_overlap_factor_height, tile_overlap_factor_width, enable_vae_slicing=True):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
         latents = samples["samples"]
         vae = pipeline["pipe"].vae
-        vae.to(device)
+        if enable_vae_slicing:
+            vae.enable_slicing()
+        else:
+            vae.disable_slicing()
+        if not pipeline["cpu_offloading"]:
+            vae.to(device)
         if enable_vae_tiling:
             vae.enable_tiling(
                 tile_sample_min_height=tile_sample_min_height,
@@ -334,12 +377,15 @@ class CogVideoDecode:
                 tile_overlap_factor_height=tile_overlap_factor_height,
                 tile_overlap_factor_width=tile_overlap_factor_width,
             )
+        else:
+            vae.disable_tiling()
         latents = latents.to(vae.dtype)
         latents = latents.permute(0, 2, 1, 3, 4)  # [batch_size, num_channels, num_frames, height, width]
         latents = 1 / vae.config.scaling_factor * latents
 
         frames = vae.decode(latents).sample
-        vae.to(offload_device)
+        if not pipeline["cpu_offloading"]:
+            vae.to(offload_device)
         mm.soft_empty_cache()
 
         video = pipeline["pipe"].video_processor.postprocess_video(video=frames, output_type="pt")
