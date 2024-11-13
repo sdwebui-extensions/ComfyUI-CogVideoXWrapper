@@ -21,11 +21,13 @@ import torch.nn.functional as F
 import math
 
 from diffusers.models import AutoencoderKLCogVideoX#, CogVideoXTransformer3DModel
+#from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.schedulers import CogVideoXDDIMScheduler, CogVideoXDPMScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from diffusers.models.embeddings import get_3d_rotary_pos_embed
+from diffusers.loaders import CogVideoXLoraLoaderMixin
 
 from .custom_cogvideox_transformer_3d import CogVideoXTransformer3DModel
 
@@ -113,7 +115,7 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
 
-class CogVideoXPipeline(VideoSysPipeline):
+class CogVideoXPipeline(VideoSysPipeline, CogVideoXLoraLoaderMixin):
     r"""
     Pipeline for text-to-video generation using CogVideoX.
 
@@ -157,13 +159,16 @@ class CogVideoXPipeline(VideoSysPipeline):
         )
         self.vae_scale_factor_temporal = (
             self.vae.config.temporal_compression_ratio if hasattr(self, "vae") and self.vae is not None else 4
-        )
+        )        
         self.original_mask = original_mask
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
-
+        self.video_processor.config.do_resize = False
 
         if pab_config is not None:
             set_pab_manager(pab_config)
+
+        self.input_with_padding = True
+
 
     def prepare_latents(
         self, batch_size, num_channels_latents, num_frames, height, width, dtype, device, generator, timesteps, denoise_strength,
@@ -295,18 +300,18 @@ class CogVideoXPipeline(VideoSysPipeline):
         weights = weights.unsqueeze(0).unsqueeze(2).unsqueeze(3).unsqueeze(4).repeat(1, t_batch_size,1, 1, 1)
         return weights
     
-    def fuse_qkv_projections(self) -> None:
-        r"""Enables fused QKV projections."""
-        self.fusing_transformer = True
-        self.transformer.fuse_qkv_projections()
+    # def fuse_qkv_projections(self) -> None:
+    #     r"""Enables fused QKV projections."""
+    #     self.fusing_transformer = True
+    #     self.transformer.fuse_qkv_projections()
 
-    def unfuse_qkv_projections(self) -> None:
-        r"""Disable QKV projection fusion if enabled."""
-        if not self.fusing_transformer:
-            logger.warning("The Transformer was not initially fused for QKV projections. Doing nothing.")
-        else:
-            self.transformer.unfuse_qkv_projections()
-            self.fusing_transformer = False
+    # def unfuse_qkv_projections(self) -> None:
+    #     r"""Disable QKV projection fusion if enabled."""
+    #     if not self.fusing_transformer:
+    #         logger.warning("The Transformer was not initially fused for QKV projections. Doing nothing.")
+    #     else:
+    #         self.transformer.unfuse_qkv_projections()
+    #         self.fusing_transformer = False
 
     def _prepare_rotary_positional_embeddings(
         self,
@@ -314,14 +319,17 @@ class CogVideoXPipeline(VideoSysPipeline):
         width: int,
         num_frames: int,
         device: torch.device,
-        start_frame: int = None,
-        end_frame: int = None,
         ) -> Tuple[torch.Tensor, torch.Tensor]:
         grid_height = height // (self.vae_scale_factor_spatial * self.transformer.config.patch_size)
         grid_width = width // (self.vae_scale_factor_spatial * self.transformer.config.patch_size)
-        base_size_width = 720 // (self.vae_scale_factor_spatial * self.transformer.config.patch_size)
-        base_size_height = 480 // (self.vae_scale_factor_spatial * self.transformer.config.patch_size)
 
+        p = self.transformer.config.patch_size
+        p_t = self.transformer.config.patch_size_t or 1
+
+        base_size_width = self.transformer.config.sample_width // p
+        base_size_height = self.transformer.config.sample_height // p
+        base_num_frames = (num_frames + p_t - 1) // p_t
+    
         grid_crops_coords = get_resize_crop_region_for_grid(
             (grid_height, grid_width), base_size_width, base_size_height
         )
@@ -329,19 +337,8 @@ class CogVideoXPipeline(VideoSysPipeline):
             embed_dim=self.transformer.config.attention_head_dim,
             crops_coords=grid_crops_coords,
             grid_size=(grid_height, grid_width),
-            temporal_size=num_frames,
-            use_real=True,
+            temporal_size=base_num_frames
         )
-        
-        if start_frame is not None:
-            freqs_cos = freqs_cos.view(num_frames, grid_height * grid_width, -1)
-            freqs_sin = freqs_sin.view(num_frames, grid_height * grid_width, -1)
-
-            freqs_cos = freqs_cos[start_frame:end_frame]
-            freqs_sin = freqs_sin[start_frame:end_frame]
-
-            freqs_cos = freqs_cos.view(-1, freqs_cos.shape[-1])
-            freqs_sin = freqs_sin.view(-1, freqs_sin.shape[-1])
 
         freqs_cos = freqs_cos.to(device=device)
         freqs_sin = freqs_sin.to(device=device)
@@ -374,6 +371,7 @@ class CogVideoXPipeline(VideoSysPipeline):
         timesteps: Optional[List[int]] = None,
         guidance_scale: float = 6,
         denoise_strength: float = 1.0,
+        sigmas: Optional[List[float]] = None,
         num_videos_per_prompt: int = 1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -434,14 +432,12 @@ class CogVideoXPipeline(VideoSysPipeline):
                 weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
                 argument.
         """
-
-        #assert (
-        #    num_frames <= 48 and num_frames % fps == 0 and fps == 8
-        #), f"The number of frames must be divisible by {fps=} and less than 48 frames (for now). Other values are not supported in CogVideoX."
-
+        
         height = height or self.transformer.config.sample_size * self.vae_scale_factor_spatial
         width = width or self.transformer.config.sample_size * self.vae_scale_factor_spatial
         num_videos_per_prompt = 1
+
+        self.num_frames = num_frames
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -460,21 +456,39 @@ class CogVideoXPipeline(VideoSysPipeline):
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
-        do_classifier_free_guidance = guidance_scale > 1.0
+        do_classifier_free_guidance = guidance_scale[0] > 1.0
 
         if do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
         prompt_embeds = prompt_embeds.to(self.vae.dtype)
 
         # 4. Prepare timesteps
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
+        if sigmas is None:
+            timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
+        else:
+            timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, sigmas=sigmas, device=device)
         self._num_timesteps = len(timesteps)
 
         # 5. Prepare latents.
         latent_channels = self.vae.config.latent_channels
+        latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
 
-        if latents is None and num_frames == t_tile_length:
-            num_frames += 1
+        # For CogVideoX 1.5, the latent frames should be padded to make it divisible by patch_size_t
+        patch_size_t = getattr(self.transformer.config, "patch_size_t", None)
+        if patch_size_t is None:
+            self.transformer.config.patch_size_t = None
+        ofs_embed_dim = getattr(self.transformer.config, "ofs_embed_dim", None)
+        if ofs_embed_dim is None:
+            self.transformer.config.ofs_embed_dim = None
+
+        self.additional_frames = 0
+        if patch_size_t is not None and latent_frames % patch_size_t != 0:
+            self.additional_frames = patch_size_t - latent_frames % patch_size_t
+            num_frames += self.additional_frames * self.vae_scale_factor_temporal
+
+
+        #if latents is None and num_frames == t_tile_length:
+        #    num_frames += 1
 
         if self.original_mask is not None:
             image_latents = latents
@@ -498,7 +512,6 @@ class CogVideoXPipeline(VideoSysPipeline):
             freenoise=freenoise,
         )
         latents = latents.to(self.vae.dtype)
-        #print("latents", latents.shape)
 
         # 5.5.
         if image_cond_latents is not None:
@@ -512,30 +525,32 @@ class CogVideoXPipeline(VideoSysPipeline):
                 width // self.vae_scale_factor_spatial,
                 )
                 latent_padding = torch.zeros(padding_shape, device=device, dtype=self.vae.dtype)
-
                 image_cond_latents = torch.cat([image_cond_latents[:, 0, :, :, :].unsqueeze(1), latent_padding, image_cond_latents[:, -1, :, :, :].unsqueeze(1)], dim=1)
+                if self.transformer.config.patch_size_t is not None:
+                        first_frame = image_cond_latents[:, : image_cond_latents.size(1) % self.transformer.config.patch_size_t, ...]
+                        image_cond_latents = torch.cat([first_frame, image_cond_latents], dim=1)
+
                 logger.info(f"image cond latents shape: {image_cond_latents.shape}")
             else:
                 logger.info("Only one image conditioning frame received, img2vid")
-                padding_shape = (
-                    batch_size,
-                    (latents.shape[1] - 1),
-                    self.vae.config.latent_channels,
-                    height // self.vae_scale_factor_spatial,
-                    width // self.vae_scale_factor_spatial,
-                )
-                latent_padding = torch.zeros(padding_shape, device=device, dtype=self.vae.dtype)
-                image_cond_latents = torch.cat([image_cond_latents, latent_padding], dim=1)
-       
+                if self.input_with_padding:
+                    padding_shape = (
+                        batch_size,
+                        (latents.shape[1] - 1),
+                        self.vae.config.latent_channels,
+                        height // self.vae_scale_factor_spatial,
+                        width // self.vae_scale_factor_spatial,
+                    )
+                    latent_padding = torch.zeros(padding_shape, device=device, dtype=self.vae.dtype)
+                    image_cond_latents = torch.cat([image_cond_latents, latent_padding], dim=1)
+                    # Select the first frame along the second dimension
+                    if self.transformer.config.patch_size_t is not None:
+                        first_frame = image_cond_latents[:, : image_cond_latents.size(1) % self.transformer.config.patch_size_t, ...]
+                        image_cond_latents = torch.cat([first_frame, image_cond_latents], dim=1)
+                else:
+                    image_cond_latents = image_cond_latents.repeat(1, latents.shape[1], 1, 1, 1)
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-
-        # 6.5. Create rotary embeds if required
-        image_rotary_emb = (
-            self._prepare_rotary_positional_embeddings(height, width, latents.size(1), device)
-            if self.transformer.config.use_rotary_positional_embeddings
-            else None
-        )
 
         # masks
         if self.original_mask is not None:
@@ -550,11 +565,10 @@ class CogVideoXPipeline(VideoSysPipeline):
             logger.info(f"latents: {latents.shape}")
             logger.info(f"mask: {mask.shape}")
 
-        # 7. Denoising loop
+      
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
-        comfy_pbar = ProgressBar(num_inference_steps)
 
-        # 8. context schedule and temporal tiling
+        # 7. context schedule and temporal tiling
         if context_schedule is not None and context_schedule == "temporal_tiling":
             t_tile_length = context_frames
             t_tile_overlap = context_overlap
@@ -574,16 +588,19 @@ class CogVideoXPipeline(VideoSysPipeline):
             use_temporal_tiling = False
             use_context_schedule = False
             logger.info("Temporal tiling and context schedule disabled")
-            # 7. Create rotary embeds if required
+            # 7.5. Create rotary embeds if required
             image_rotary_emb = (
                 self._prepare_rotary_positional_embeddings(height, width, latents.size(1), device)
                 if self.transformer.config.use_rotary_positional_embeddings
                 else None
             )
+            # 7.6. Create ofs embeds if required
+            ofs_emb = None if self.transformer.config.ofs_embed_dim is None else latents.new_full((1,), fill_value=2.0)
+
             if tora is not None and do_classifier_free_guidance:
                 video_flow_features = tora["video_flow_features"].repeat(1, 2, 1, 1, 1).contiguous()
 
-        # 9. Controlnet
+        #8. Controlnet
         if controlnet is not None:
             self.controlnet = controlnet["control_model"].to(device)
             if self.transformer.dtype == torch.float8_e4m3fn:
@@ -610,12 +627,22 @@ class CogVideoXPipeline(VideoSysPipeline):
             control_weights= None
 
         if tora is not None:
+            trajectory_length = tora["video_flow_features"].shape[1]
+            logger.info(f"Tora trajectory length: {trajectory_length}")
+            #if trajectory_length != latents.shape[1]:
+            #    raise ValueError(f"Tora trajectory length {trajectory_length} does not match inpaint_latents count {latents.shape[2]}")
             for module in self.transformer.fuser_list:
                 for param in module.parameters():
                     param.data = param.data.to(device)
 
-        # 10. Denoising loop
-        with self.progress_bar(total=num_inference_steps) as progress_bar:    
+        logger.info(f"Sampling {num_frames} frames in {latent_frames} latent frames at {width}x{height} with {num_inference_steps} inference steps")
+
+        from .latent_preview import prepare_callback
+        callback = prepare_callback(self.transformer, num_inference_steps)
+
+        # 9. Denoising loop
+        comfy_pbar = ProgressBar(len(timesteps))
+        with self.progress_bar(total=len(timesteps)) as progress_bar:    
             old_pred_original_sample = None # for DPM-solver++
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -670,7 +697,7 @@ class CogVideoXPipeline(VideoSysPipeline):
 
                         if self.do_classifier_free_guidance:
                             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                            noise_pred = noise_pred_uncond + self._guidance_scale * (noise_pred_text - noise_pred_uncond)
+                            noise_pred = noise_pred_uncond + self._guidance_scale[i] * (noise_pred_text - noise_pred_uncond)
 
                         # compute the previous noisy sample x_t -> x_t-1
                         latents_tile = self.scheduler.step(noise_pred, t, latents_tile.to(self.vae.dtype), **extra_step_kwargs, return_dict=False)[0]
@@ -811,7 +838,7 @@ class CogVideoXPipeline(VideoSysPipeline):
                     noise_pred /= counter
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + self._guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        noise_pred = noise_pred_uncond + self._guidance_scale[i] * (noise_pred_text - noise_pred_uncond)
                        
                     # compute the previous noisy sample x_t -> x_t-1
                     if not isinstance(self.scheduler, CogVideoXDPMScheduler):
@@ -869,22 +896,21 @@ class CogVideoXPipeline(VideoSysPipeline):
                         encoder_hidden_states=prompt_embeds,
                         timestep=timestep,
                         image_rotary_emb=image_rotary_emb,
+                        ofs=ofs_emb,
                         return_dict=False,
                         controlnet_states=controlnet_states,
                         controlnet_weights=control_weights,
                         video_flow_features=video_flow_features if (tora is not None and tora["start_percent"] <= current_step_percentage <= tora["end_percent"]) else None,
-
                     )[0]
                     noise_pred = noise_pred.float()
-
                     if isinstance(self.scheduler, CogVideoXDPMScheduler):
-                        self._guidance_scale = 1 + guidance_scale * (
+                        self._guidance_scale[i] = 1 + guidance_scale[i] * (
                             (1 - math.cos(math.pi * ((num_inference_steps - t.item()) / num_inference_steps) ** 5.0)) / 2
                         )
                     
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                        noise_pred = noise_pred_uncond + self._guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        noise_pred = noise_pred_uncond + self._guidance_scale[i] * (noise_pred_text - noise_pred_uncond)
 
                     # compute the previous noisy sample x_t -> x_t-1
                     if not isinstance(self.scheduler, CogVideoXDPMScheduler):
@@ -915,7 +941,10 @@ class CogVideoXPipeline(VideoSysPipeline):
 
                     if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                         progress_bar.update()
-                        comfy_pbar.update(1)
+                        if callback is not None:
+                            callback(i, latents.detach()[-1], None, num_inference_steps)
+                        else:
+                            comfy_pbar.update(1)
             
 
         # Offload all models

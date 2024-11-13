@@ -1,4 +1,13 @@
 # WORK IN PROGRESS
+
+## Update7
+
+- Refactored the Fun version's sampler to accept any resolution, this should make it lot simpler to use with Tora. **BREAKS OLD WORKFLOWS**, old FunSampler nodes need to be remade.
+- The old bucket resizing is now on it's own node (CogVideoXFunResizeToClosestBucket) to keep the functionality, I honestly don't know if it matters at all, but just in case.
+- Fun version's vid2vid is now also in the same node, the old vid2vid node is deprecated.
+- Added support for FasterCache, this trades more VRAM use for speed with slight quality hit, similar to PAB: https://github.com/Vchitect/FasterCache
+- Improved torch.compile support, it actually works now
+
 ## Update6
 
 Initial support for Tora (https://github.com/alibaba/Tora)
@@ -11,9 +20,6 @@ https://huggingface.co/Kijai/CogVideoX-5b-Tora/tree/main
 https://github.com/user-attachments/assets/d5334237-03dc-48f5-8bec-3ae5998660c6
 
 
-
-
-
 ## Update5
 This week there's been some bigger updates that will most likely affect some old workflows, sampler node especially probably need to be refreshed (re-created) if it errors out!
 
@@ -21,7 +27,7 @@ New features:
 - Initial context windowing with FreeNoise noise shuffling mainly for vid2vid and pose2vid pipelines for longer generations, haven't figured it out for img2vid yet
 - GGUF models and tiled encoding for I2V and pose pipelines (thanks to MinusZoneAI)
 - [sageattention](https://github.com/thu-ml/SageAttention) support (Linux only) for a speed boost, I experienced ~20-30% increase with it, stacks with fp8 fast mode, doesn't need compiling
-- Support CogVideoX-Fun 1.1 and it's pose models with additional control strenght and application step settings, this model's input does NOT have to be just dwpose skeletons, just about anything can work
+- Support CogVideoX-Fun 1.1 and it's pose models with additional control strength and application step settings, this model's input does NOT have to be just dwpose skeletons, just about anything can work
 - Support LoRAs
 
 https://github.com/user-attachments/assets/ddeb8f38-a647-42b3-a4b1-c6936f961deb
