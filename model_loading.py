@@ -161,12 +161,16 @@ class DownloadAndLoadCogVideoModel:
             subfolder = "transformer"
             allow_patterns = ["*transformer*", "*scheduler*", "*vae*"]
         elif "1.5-T2V" in model or "1.5-I2V" in model:
+            if os.path.exists(folder_paths.cache_dir):
+                download_path = os.path.join(folder_paths.cache_dir, "CogVideo")
             base_path = os.path.join(download_path, "CogVideoX-5b-1.5")
             download_path = base_path
             subfolder = "transformer_T2V" if "1.5-T2V" in model else "transformer_I2V"
             allow_patterns = [f"*{subfolder}*", "*vae*", "*scheduler*"]
             repo_id = "kijai/CogVideoX-5b-1.5"
         else:
+            if os.path.exists(folder_paths.cache_dir):
+                download_path = os.path.join(folder_paths.cache_dir, "CogVideo")
             base_path = os.path.join(download_path, (model.split("/")[-1]))
             download_path = base_path
             repo_id = model
@@ -178,7 +182,7 @@ class DownloadAndLoadCogVideoModel:
         else:
             scheduler_path = os.path.join(script_directory, 'configs', 'scheduler_config_5b.json')
         
-        if not os.path.exists(base_path) or not os.path.exists(os.path.join(base_path, subfolder)):
+        if not os.path.exists(base_path) or not os.path.exists(os.path.join(base_path, subfolder)) or not os.path.exists(download_path):
             log.info(f"Downloading model to: {base_path}")
             from huggingface_hub import snapshot_download
 
