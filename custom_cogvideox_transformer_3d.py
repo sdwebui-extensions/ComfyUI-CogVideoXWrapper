@@ -44,6 +44,12 @@ try:
 except:
     SAGEATTN_IS_AVAILABLE = False
 
+from comfy.ldm.modules.attention import optimized_attention
+
+@torch.compiler.disable()
+def sageattn_func(query, key, value, attn_mask=None, dropout_p=0.0,is_causal=False):
+    return sageattn(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p,is_causal=is_causal)
+
 def fft(tensor):
     tensor_fft = torch.fft.fft2(tensor)
     tensor_fft_shifted = torch.fft.fftshift(tensor_fft)
@@ -71,7 +77,6 @@ class CogVideoXAttnProcessor2_0:
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("CogVideoXAttnProcessor requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
         
-    #@torch.compiler.disable()
     def __call__(
         self,
         attn: Attention,
@@ -93,9 +98,14 @@ class CogVideoXAttnProcessor2_0:
             attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
             attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
 
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
+        if attention_mode != "fused_sdpa" or attention_mode != "fused_sageattn":
+            query = attn.to_q(hidden_states)
+            key = attn.to_k(hidden_states)
+            value = attn.to_v(hidden_states)
+        else:
+            qkv = attn.to_qkv(hidden_states)
+            split_size = qkv.shape[-1] // 3
+            query, key, value = torch.split(qkv, split_size, dim=-1)
 
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
@@ -115,20 +125,17 @@ class CogVideoXAttnProcessor2_0:
             if not attn.is_cross_attention:
                 key[:, :, text_seq_length:] = apply_rotary_emb(key[:, :, text_seq_length:], image_rotary_emb)
                  
-        if attention_mode == "sageattn":
-            if SAGEATTN_IS_AVAILABLE:
-               hidden_states = sageattn(query, key, value, attn_mask=attention_mask, dropout_p=0.0,is_causal=False)
-            else:
-                raise ImportError("sageattn not found")
-        else:
+        if attention_mode == "sageattn" or attention_mode == "fused_sageattn":
+            hidden_states = sageattn_func(query, key, value, attn_mask=attention_mask, dropout_p=0.0,is_causal=False)
+            hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        elif attention_mode == "sdpa":
             hidden_states = F.scaled_dot_product_attention(
                 query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
                 )
-        #if torch.isinf(hidden_states).any():
-        #    raise ValueError(f"hidden_states after dot product has inf")
-
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
-
+            hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        elif attention_mode == "comfy":
+            hidden_states = optimized_attention(query, key, value, mask=attention_mask, heads=attn.heads, skip_reshape=True)
+ 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
         # dropout
@@ -193,7 +200,6 @@ class CogVideoXBlock(nn.Module):
         ff_inner_dim: Optional[int] = None,
         ff_bias: bool = True,
         attention_out_bias: bool = True,
-        attention_mode: Optional[str] = None,
     ):
         super().__init__()
 
@@ -225,7 +231,6 @@ class CogVideoXBlock(nn.Module):
         )
         self.cached_hidden_states = []
         self.cached_encoder_hidden_states = []
-        self.attention_mode = attention_mode
         
     def forward(
         self,
@@ -239,14 +244,16 @@ class CogVideoXBlock(nn.Module):
         fastercache_counter=0,
         fastercache_start_step=15,
         fastercache_device="cuda:0",
+        attention_mode="sdpa",
     ) -> torch.Tensor:
-    
+        #print("hidden_states in block: ", hidden_states.shape) #1.5: torch.Size([2, 3200, 3072]) 10.: torch.Size([2, 6400, 3072])
         text_seq_length = encoder_hidden_states.size(1)
 
         # norm & modulate
         norm_hidden_states, norm_encoder_hidden_states, gate_msa, enc_gate_msa = self.norm1(
             hidden_states, encoder_hidden_states, temb
         )
+        #print("norm_hidden_states in block: ", norm_hidden_states.shape) #torch.Size([2, 3200, 3072])
       
         # Tora Motion-guidance Fuser
         if video_flow_feature is not None:
@@ -276,7 +283,7 @@ class CogVideoXBlock(nn.Module):
                     hidden_states=norm_hidden_states,
                     encoder_hidden_states=norm_encoder_hidden_states,
                     image_rotary_emb=image_rotary_emb,
-                    attention_mode=self.attention_mode,
+                    attention_mode=attention_mode,
                 )
                 if fastercache_counter == fastercache_start_step:
                     self.cached_hidden_states = [attn_hidden_states.to(fastercache_device), attn_hidden_states.to(fastercache_device)]
@@ -289,7 +296,7 @@ class CogVideoXBlock(nn.Module):
                 hidden_states=norm_hidden_states,
                 encoder_hidden_states=norm_encoder_hidden_states,
                 image_rotary_emb=image_rotary_emb,
-                attention_mode=self.attention_mode,
+                attention_mode=attention_mode,
             )
         
         hidden_states = hidden_states + gate_msa * attn_hidden_states
@@ -398,7 +405,6 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         use_rotary_positional_embeddings: bool = False,
         use_learned_positional_embeddings: bool = False,
         patch_bias: bool = True,
-        attention_mode: Optional[str] = None,
     ):
         super().__init__()
         inner_dim = num_attention_heads * attention_head_dim
@@ -487,7 +493,8 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         self.fastercache_hf_step = 30
         self.fastercache_device = "cuda"
         self.fastercache_num_blocks_to_cache = len(self.transformer_blocks)
-        self.attention_mode = attention_mode
+        self.attention_mode = "sdpa"
+        
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
@@ -587,41 +594,46 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         # 2. Patch embedding
         p = self.config.patch_size
         p_t = self.config.patch_size_t
+
+        #print("hidden_states before patch_embedding", hidden_states.shape) #torch.Size([2, 4, 16, 60, 90])
         
         hidden_states = self.patch_embed(encoder_hidden_states, hidden_states)
+        #print("hidden_states after patch_embedding", hidden_states.shape) #1.5: torch.Size([2, 2926, 3072]) #1.0: torch.Size([2, 5626, 3072])
         hidden_states = self.embedding_dropout(hidden_states)
 
         text_seq_length = encoder_hidden_states.shape[1]
         encoder_hidden_states = hidden_states[:, :text_seq_length]
         hidden_states = hidden_states[:, text_seq_length:]
+        #print("hidden_states after split", hidden_states.shape) #1.5: torch.Size([2, 2700, 3072]) #1.0: torch.Size([2, 5400, 3072])
       
         if self.use_fastercache:
             self.fastercache_counter+=1
         if self.fastercache_counter >= self.fastercache_start_step + 3 and self.fastercache_counter % 5 !=0:
             # 3. Transformer blocks
             for i, block in enumerate(self.transformer_blocks):
-                    hidden_states, encoder_hidden_states = block(
-                        hidden_states=hidden_states[:1],
-                        encoder_hidden_states=encoder_hidden_states[:1],
-                        temb=emb[:1],
-                        image_rotary_emb=image_rotary_emb,
-                        video_flow_feature=video_flow_features[i][:1] if video_flow_features is not None else None,
-                        fuser = self.fuser_list[i] if self.fuser_list is not None else None,
-                        block_use_fastercache = i <= self.fastercache_num_blocks_to_cache,
-                        fastercache_counter = self.fastercache_counter,
-                        fastercache_start_step = self.fastercache_start_step,
-                        fastercache_device = self.fastercache_device
-                    )
+                hidden_states, encoder_hidden_states = block(
+                    hidden_states=hidden_states[:1],
+                    encoder_hidden_states=encoder_hidden_states[:1],
+                    temb=emb[:1],
+                    image_rotary_emb=image_rotary_emb,
+                    video_flow_feature=video_flow_features[i][:1] if video_flow_features is not None else None,
+                    fuser = self.fuser_list[i] if self.fuser_list is not None else None,
+                    block_use_fastercache = i <= self.fastercache_num_blocks_to_cache,
+                    fastercache_counter = self.fastercache_counter,
+                    fastercache_start_step = self.fastercache_start_step,
+                    fastercache_device = self.fastercache_device,
+                    attention_mode = self.attention_mode
+                )
 
-                    if (controlnet_states is not None) and (i < len(controlnet_states)):
-                        controlnet_states_block = controlnet_states[i]
-                        controlnet_block_weight = 1.0
-                        if isinstance(controlnet_weights, (list, np.ndarray)) or torch.is_tensor(controlnet_weights):
-                            controlnet_block_weight = controlnet_weights[i]
-                        elif isinstance(controlnet_weights, (float, int)):
-                            controlnet_block_weight = controlnet_weights
-                        
-                        hidden_states = hidden_states + controlnet_states_block * controlnet_block_weight
+                if (controlnet_states is not None) and (i < len(controlnet_states)):
+                    controlnet_states_block = controlnet_states[i]
+                    controlnet_block_weight = 1.0
+                    if isinstance(controlnet_weights, (list, np.ndarray)) or torch.is_tensor(controlnet_weights):
+                        controlnet_block_weight = controlnet_weights[i]
+                    elif isinstance(controlnet_weights, (float, int)):
+                        controlnet_block_weight = controlnet_weights
+                    
+                    hidden_states = hidden_states + controlnet_states_block * controlnet_block_weight
                     
             if not self.config.use_rotary_positional_embeddings:
                 # CogVideoX-2B
@@ -680,21 +692,23 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     block_use_fastercache = i <= self.fastercache_num_blocks_to_cache,
                     fastercache_counter = self.fastercache_counter,
                     fastercache_start_step = self.fastercache_start_step,
-                    fastercache_device = self.fastercache_device
+                    fastercache_device = self.fastercache_device,
+                    attention_mode = self.attention_mode
                 )
                 #has_nan = torch.isnan(hidden_states).any()
                 #if has_nan:
                 #    raise ValueError(f"block output hidden_states has nan: {has_nan}")
 
-            if (controlnet_states is not None) and (i < len(controlnet_states)):
-                controlnet_states_block = controlnet_states[i]
-                controlnet_block_weight = 1.0
-                if isinstance(controlnet_weights, (list, np.ndarray)) or torch.is_tensor(controlnet_weights):
-                    controlnet_block_weight = controlnet_weights[i]
-                elif isinstance(controlnet_weights, (float, int)):
-                    controlnet_block_weight = controlnet_weights
-                
-                hidden_states = hidden_states + controlnet_states_block * controlnet_block_weight
+                #controlnet
+                if (controlnet_states is not None) and (i < len(controlnet_states)):
+                    controlnet_states_block = controlnet_states[i]
+                    controlnet_block_weight = 1.0
+                    if isinstance(controlnet_weights, (list, np.ndarray)) or torch.is_tensor(controlnet_weights):
+                        controlnet_block_weight = controlnet_weights[i]
+                        print(controlnet_block_weight)
+                    elif isinstance(controlnet_weights, (float, int)):
+                        controlnet_block_weight = controlnet_weights                    
+                    hidden_states = hidden_states + controlnet_states_block * controlnet_block_weight
                     
             if not self.config.use_rotary_positional_embeddings:
                 # CogVideoX-2B
