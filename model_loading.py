@@ -139,6 +139,12 @@ class DownloadAndLoadCogVideoModel:
                   enable_sequential_cpu_offload=False, block_edit=None, lora=None, compile_args=None, 
                   attention_mode="sdpa", load_device="main_device"):
         
+        if "sage" in attention_mode:
+            try:
+                from sageattention import sageattn
+            except Exception as e:
+                raise ValueError(f"Can't import SageAttention: {str(e)}")
+        
         if precision == "fp16" and "1.5" in model:
             raise ValueError("1.5 models do not currently work in fp16")
 
@@ -249,16 +255,21 @@ class DownloadAndLoadCogVideoModel:
         
         #LoRAs
         if lora is not None:
-            try:
-                adapter_list = []
-                adapter_weights = []
-                for l in lora:
-                    fuse = True if l["fuse_lora"] else False
-                    lora_sd = load_torch_file(l["path"])             
-                    for key, val in lora_sd.items():
-                        if "lora_B" in key:
-                            lora_rank = val.shape[1]
-                            break
+            dimensionx_loras = ["orbit", "dimensionx"] # for now dimensionx loras need scaling
+            dimensionx_lora = False
+            adapter_list = []
+            adapter_weights = []
+            for l in lora:
+                if any(item in l["path"].lower() for item in dimensionx_loras):
+                    dimensionx_lora = True
+                fuse = True if l["fuse_lora"] else False
+                lora_sd = load_torch_file(l["path"])
+                lora_rank = None            
+                for key, val in lora_sd.items():
+                    if "lora_B" in key:
+                        lora_rank = val.shape[1]
+                        break
+                if lora_rank is not None:
                     log.info(f"Merging rank {lora_rank} LoRA weights from {l['path']} with strength {l['strength']}")
                     adapter_name = l['path'].split("/")[-1].split(".")[0]
                     adapter_weight = l['strength']
@@ -266,27 +277,29 @@ class DownloadAndLoadCogVideoModel:
                     
                     adapter_list.append(adapter_name)
                     adapter_weights.append(adapter_weight)
-                for l in lora:
-                    pipe.set_adapters(adapter_list, adapter_weights=adapter_weights)
+                else:
+                    try: #Fun trainer LoRAs are loaded differently
+                        from .lora_utils import merge_lora
+                        log.info(f"Merging LoRA weights from {l['path']} with strength {l['strength']}")
+                        pipe.transformer = merge_lora(pipe.transformer, l["path"], l["strength"], device=transformer_load_device, state_dict=lora_sd)
+                    except:
+                        raise ValueError(f"Can't recognize LoRA {l['path']}")
+            if adapter_list:
+                pipe.set_adapters(adapter_list, adapter_weights=adapter_weights)
                 if fuse:
                     lora_scale = 1
-                    dimension_loras = ["orbit", "dimensionx"] # for now dimensionx loras need scaling
-                    if any(item in lora[-1]["path"].lower() for item in dimension_loras):
+                    if dimensionx_lora:
                         lora_scale = lora_scale / lora_rank
                     pipe.fuse_lora(lora_scale=lora_scale, components=["transformer"])
-            except: #Fun trainer LoRAs are loaded differently
-                from .lora_utils import merge_lora
-                for l in lora:
-                    log.info(f"Merging LoRA weights from {l['path']} with strength {l['strength']}")
-                    transformer = merge_lora(transformer, l["path"], l["strength"])
+           
 
         if "fused" in attention_mode:
             from diffusers.models.attention import Attention
-            transformer.fuse_qkv_projections = True
-            for module in transformer.modules():
+            pipe.transformer.fuse_qkv_projections = True
+            for module in pipe.transformer.modules():
                 if isinstance(module, Attention):
                     module.fuse_projections(fuse=True)
-        transformer.attention_mode = attention_mode
+        pipe.transformer.attention_mode = attention_mode
 
         if compile_args is not None:
             pipe.transformer.to(memory_format=torch.channels_last)
@@ -399,6 +412,7 @@ class DownloadAndLoadCogVideoModel:
         pipeline = {
             "pipe": pipe,
             "dtype": dtype,
+            "quantization": quantization,
             "base_path": base_path,
             "onediff": True if compile == "onediff" else False,
             "cpu_offloading": enable_sequential_cpu_offload,
@@ -445,6 +459,12 @@ class DownloadAndLoadCogVideoGGUFModel:
 
     def loadmodel(self, model, vae_precision, fp8_fastmode, load_device, enable_sequential_cpu_offload, 
                   block_edit=None, compile_args=None, attention_mode="sdpa"):
+        
+        if "sage" in attention_mode:
+            try:
+                from sageattention import sageattn
+            except Exception as e:
+                raise ValueError(f"Can't import SageAttention: {str(e)}")
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -582,6 +602,7 @@ class DownloadAndLoadCogVideoGGUFModel:
         pipeline = {
             "pipe": pipe,
             "dtype": vae_dtype,
+            "quantization": "GGUF",
             "base_path": model,
             "onediff": False,
             "cpu_offloading": enable_sequential_cpu_offload,
@@ -598,7 +619,7 @@ class CogVideoXModelLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "The name of the checkpoint (model) to load.",}),
+                "model": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "These models are loaded from the 'ComfyUI/models/diffusion_models' -folder",}),
             
             "base_precision": (["fp16", "fp32", "bf16"], {"default": "bf16"}),
             "quantization": (['disabled', 'fp8_e4m3fn', 'fp8_e4m3fn_fast', 'torchao_fp8dq', "torchao_fp8dqrow", "torchao_int8dq", "torchao_fp6"], {"default": 'disabled', "tooltip": "optional quantization method"}),
@@ -620,6 +641,12 @@ class CogVideoXModelLoader:
 
     def loadmodel(self, model, base_precision, load_device, enable_sequential_cpu_offload, 
                   block_edit=None, compile_args=None, lora=None, attention_mode="sdpa", quantization="disabled"):
+        
+        if "sage" in attention_mode:
+            try:
+                from sageattention import sageattn
+            except Exception as e:
+                raise ValueError(f"Can't import SageAttention: {str(e)}")
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -719,35 +746,40 @@ class CogVideoXModelLoader:
 
         #LoRAs
         if lora is not None:
-            from .lora_utils import merge_lora#, load_lora_into_transformer
-            if "fun" in model.lower():
-                for l in lora:
-                    log.info(f"Merging LoRA weights from {l['path']} with strength {l['strength']}")
-                    transformer = merge_lora(transformer, l["path"], l["strength"])
-            else:
-                adapter_list = []
-                adapter_weights = []
-                for l in lora:
-                    fuse = True if l["fuse_lora"] else False
-                    lora_sd = load_torch_file(l["path"])             
-                    for key, val in lora_sd.items():
-                        if "lora_B" in key:
-                            lora_rank = val.shape[1]
-                            break
+            dimensionx_loras = ["orbit", "dimensionx"] # for now dimensionx loras need scaling
+            dimensionx_lora = False
+            adapter_list = []
+            adapter_weights = []
+            for l in lora:
+                if any(item in l["path"].lower() for item in dimensionx_loras):
+                    dimensionx_lora = True
+                fuse = True if l["fuse_lora"] else False
+                lora_sd = load_torch_file(l["path"])
+                lora_rank = None            
+                for key, val in lora_sd.items():
+                    if "lora_B" in key:
+                        lora_rank = val.shape[1]
+                        break
+                if lora_rank is not None:
                     log.info(f"Merging rank {lora_rank} LoRA weights from {l['path']} with strength {l['strength']}")
                     adapter_name = l['path'].split("/")[-1].split(".")[0]
                     adapter_weight = l['strength']
                     pipe.load_lora_weights(l['path'], weight_name=l['path'].split("/")[-1], lora_rank=lora_rank, adapter_name=adapter_name)
                     
-                    #transformer = load_lora_into_transformer(lora, transformer)
                     adapter_list.append(adapter_name)
                     adapter_weights.append(adapter_weight)
-                for l in lora:
-                    pipe.set_adapters(adapter_list, adapter_weights=adapter_weights)
+                else:
+                    try: #Fun trainer LoRAs are loaded differently
+                        from .lora_utils import merge_lora
+                        log.info(f"Merging LoRA weights from {l['path']} with strength {l['strength']}")
+                        pipe.transformer = merge_lora(pipe.transformer, l["path"], l["strength"], device=transformer_load_device, state_dict=lora_sd)
+                    except:
+                        raise ValueError(f"Can't recognize LoRA {l['path']}")
+            if adapter_list:
+                pipe.set_adapters(adapter_list, adapter_weights=adapter_weights)
                 if fuse:
                     lora_scale = 1
-                    dimension_loras = ["orbit", "dimensionx"] # for now dimensionx loras need scaling
-                    if any(item in lora[-1]["path"].lower() for item in dimension_loras):
+                    if dimensionx_lora:
                         lora_scale = lora_scale / lora_rank
                     pipe.fuse_lora(lora_scale=lora_scale, components=["transformer"])
 
@@ -813,6 +845,7 @@ class CogVideoXModelLoader:
         pipeline = {
             "pipe": pipe,
             "dtype": base_dtype,
+            "quantization": quantization,
             "base_path": model,
             "onediff": False,
             "cpu_offloading": enable_sequential_cpu_offload,
@@ -829,12 +862,13 @@ class CogVideoXVAELoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model_name": (folder_paths.get_filename_list("vae"), {"tooltip": "The name of the checkpoint (vae) to load."}),
+                "model_name": (folder_paths.get_filename_list("vae"), {"tooltip": "These models are loaded from 'ComfyUI/models/vae'"}),
             },
             "optional": {
                 "precision": (["fp16", "fp32", "bf16"],
                     {"default": "bf16"}
                 ),
+                "compile_args":("COMPILEARGS", ),
             }
         }
 
@@ -844,7 +878,7 @@ class CogVideoXVAELoader:
     CATEGORY = "CogVideoWrapper"
     DESCRIPTION = "Loads CogVideoX VAE model from 'ComfyUI/models/vae'"
 
-    def loadmodel(self, model_name, precision):
+    def loadmodel(self, model_name, precision, compile_args=None):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
@@ -856,6 +890,10 @@ class CogVideoXVAELoader:
 
         vae = AutoencoderKLCogVideoX.from_config(vae_config).to(dtype).to(offload_device)
         vae.load_state_dict(vae_sd)
+        #compile
+        if compile_args is not None:
+            torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
+            vae = torch.compile(vae, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
 
         return (vae,)
     

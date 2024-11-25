@@ -365,7 +365,7 @@ class CogVideoImageEncodeFunInP:
 
         mask = torch.zeros_like(masked_image_latents[:, :, :1, :, :])
         if end_image is not None:
-            mask[:, -1, :, :, :] = vae_scaling_factor
+            mask[:, -1, :, :, :] = 0
         mask[:, 0, :, :, :] = vae_scaling_factor
 
         final_latents = masked_image_latents * vae_scaling_factor
@@ -606,10 +606,16 @@ class CogVideoSampler:
 
     def process(self, model, positive, negative, steps, cfg, seed, scheduler, num_frames, samples=None,
                 denoise_strength=1.0, image_cond_latents=None, context_options=None, controlnet=None, tora_trajectory=None, fastercache=None):
+        mm.unload_all_models()
         mm.soft_empty_cache()
 
         model_name = model.get("model_name", "")
-        supports_image_conds = True if "I2V" in model_name or "interpolation" in model_name.lower() or "fun" in model_name.lower() else False
+        supports_image_conds = True if (
+        "I2V" in model_name or 
+        "interpolation" in model_name.lower() or 
+        "fun" in model_name.lower() or
+        "img2vid" in model_name.lower()
+        ) else False
         if "fun" in model_name.lower() and not ("pose" in model_name.lower() or "control" in model_name.lower()) and image_cond_latents is not None:
             assert image_cond_latents["mask"] is not None, "For fun inpaint models use CogVideoImageEncodeFunInP"
             fun_mask = image_cond_latents["mask"]
@@ -693,8 +699,9 @@ class CogVideoSampler:
         except:
             pass
   
-        autocastcondition = not model["onediff"] or not dtype == torch.float32
-        autocast_context = torch.autocast(mm.get_autocast_device(device), dtype=dtype) if autocastcondition else nullcontext()
+        autocast_context = torch.autocast(
+            mm.get_autocast_device(device), dtype=dtype
+        ) if any(q in model["quantization"] for q in ("e4m3fn", "GGUF")) else nullcontext()
         with autocast_context:
             latents = model["pipe"](
                 num_inference_steps=steps,
@@ -717,8 +724,8 @@ class CogVideoSampler:
                 freenoise=context_options["freenoise"] if context_options is not None else None,
                 controlnet=controlnet,
                 tora=tora_trajectory if tora_trajectory is not None else None,
-                image_cond_start_percent=image_cond_start_percent,
-                image_cond_end_percent=image_cond_end_percent
+                image_cond_start_percent=image_cond_start_percent if image_cond_latents is not None else 0.0,
+                image_cond_end_percent=image_cond_end_percent if image_cond_latents is not None else 1.0,
             )
         if not model["cpu_offloading"] and model["manual_offloading"]:
             pipe.transformer.to(offload_device)
