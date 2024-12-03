@@ -70,12 +70,50 @@ class CogVideoLoraSelect:
     RETURN_NAMES = ("lora", )
     FUNCTION = "getlorapath"
     CATEGORY = "CogVideoWrapper"
+    DESCRIPTION = "Select a LoRA model from ComfyUI/models/CogVideo/loras"
 
     def getlorapath(self, lora, strength, prev_lora=None, fuse_lora=False):
         cog_loras_list = []
 
         cog_lora = {
             "path": folder_paths.get_full_path("cogvideox_loras", lora),
+            "strength": strength,
+            "name": lora.split(".")[0],
+            "fuse_lora": fuse_lora
+        }
+        if prev_lora is not None:
+            cog_loras_list.extend(prev_lora)
+            
+        cog_loras_list.append(cog_lora)
+        print(cog_loras_list)
+        return (cog_loras_list,)
+
+class CogVideoLoraSelectComfy:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+               "lora": (folder_paths.get_filename_list("loras"), 
+                {"tooltip": "LORA models are expected to be in ComfyUI/models/loras with .safetensors extension"}),
+                "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.0001, "tooltip": "LORA strength, set to 0.0 to unmerge the LORA"}),
+            },
+            "optional": {
+                "prev_lora":("COGLORA", {"default": None, "tooltip": "For loading multiple LoRAs"}),
+                "fuse_lora": ("BOOLEAN", {"default": False, "tooltip": "Fuse the LoRA weights into the transformer"}),
+            }
+        }
+
+    RETURN_TYPES = ("COGLORA",)
+    RETURN_NAMES = ("lora", )
+    FUNCTION = "getlorapath"
+    CATEGORY = "CogVideoWrapper"
+    DESCRIPTION = "Select a LoRA model from ComfyUI/models/loras"
+
+    def getlorapath(self, lora, strength, prev_lora=None, fuse_lora=False):
+        cog_loras_list = []
+
+        cog_lora = {
+            "path": folder_paths.get_full_path("loras", lora),
             "strength": strength,
             "name": lora.split(".")[0],
             "fuse_lora": fuse_lora
@@ -124,7 +162,19 @@ class DownloadAndLoadCogVideoModel:
                 "block_edit": ("TRANSFORMERBLOCKS", {"default": None}),
                 "lora": ("COGLORA", {"default": None}),
                 "compile_args":("COMPILEARGS", ),
-                "attention_mode": (["sdpa", "sageattn", "fused_sdpa", "fused_sageattn", "comfy"], {"default": "sdpa"}),
+                "attention_mode": ([
+                    "sdpa",
+                    "fused_sdpa",
+                    "sageattn",
+                    "fused_sageattn", 
+                    "sageattn_qk_int8_pv_fp8_cuda",
+                    "sageattn_qk_int8_pv_fp16_cuda",
+                    "sageattn_qk_int8_pv_fp16_triton",
+                    "fused_sageattn_qk_int8_pv_fp8_cuda",
+                    "fused_sageattn_qk_int8_pv_fp16_cuda",
+                    "fused_sageattn_qk_int8_pv_fp16_triton",
+                    "comfy"
+                    ], {"default": "sdpa"}),
                 "load_device": (["main_device", "offload_device"], {"default": "main_device"}),
             }
         }
@@ -139,11 +189,18 @@ class DownloadAndLoadCogVideoModel:
                   enable_sequential_cpu_offload=False, block_edit=None, lora=None, compile_args=None, 
                   attention_mode="sdpa", load_device="main_device"):
         
+        transformer = None
+
         if "sage" in attention_mode:
             try:
                 from sageattention import sageattn
             except Exception as e:
                 raise ValueError(f"Can't import SageAttention: {str(e)}")
+            if "qk_int8" in attention_mode:
+                try:
+                    from sageattention import sageattn_qk_int8_pv_fp16_cuda
+                except Exception as e:
+                    raise ValueError(f"Can't import SageAttention 2.0.0: {str(e)}")
         
         if precision == "fp16" and "1.5" in model:
             raise ValueError("1.5 models do not currently work in fp16")
@@ -226,7 +283,7 @@ class DownloadAndLoadCogVideoModel:
                 local_dir_use_symlinks=False,
             )
 
-        transformer = CogVideoXTransformer3DModel.from_pretrained(base_path, subfolder=subfolder)
+        transformer = CogVideoXTransformer3DModel.from_pretrained(base_path, subfolder=subfolder, attention_mode=attention_mode)
         transformer = transformer.to(dtype).to(transformer_load_device)
 
         if "1.5" in model:
@@ -299,7 +356,6 @@ class DownloadAndLoadCogVideoModel:
             for module in pipe.transformer.modules():
                 if isinstance(module, Attention):
                     module.fuse_projections(fuse=True)
-        pipe.transformer.attention_mode = attention_mode
 
         if compile_args is not None:
             pipe.transformer.to(memory_format=torch.channels_last)
@@ -526,7 +582,7 @@ class DownloadAndLoadCogVideoGGUFModel:
             else:
                 transformer_config["in_channels"] = 16
 
-            transformer = CogVideoXTransformer3DModel.from_config(transformer_config)
+            transformer = CogVideoXTransformer3DModel.from_config(transformer_config, attention_mode=attention_mode)
             cast_dtype = vae_dtype
             params_to_keep = {"patch_embed", "pos_embedding", "time_embedding"}
             if "2b" in model:
@@ -630,7 +686,19 @@ class CogVideoXModelLoader:
                 "block_edit": ("TRANSFORMERBLOCKS", {"default": None}),
                 "lora": ("COGLORA", {"default": None}),
                 "compile_args":("COMPILEARGS", ),
-                "attention_mode": (["sdpa", "sageattn", "fused_sdpa", "fused_sageattn"], {"default": "sdpa"}),
+                "attention_mode": ([
+                    "sdpa",
+                    "fused_sdpa",
+                    "sageattn",
+                    "fused_sageattn", 
+                    "sageattn_qk_int8_pv_fp8_cuda",
+                    "sageattn_qk_int8_pv_fp16_cuda",
+                    "sageattn_qk_int8_pv_fp16_triton",
+                    "fused_sageattn_qk_int8_pv_fp8_cuda",
+                    "fused_sageattn_qk_int8_pv_fp16_cuda",
+                    "fused_sageattn_qk_int8_pv_fp16_triton",
+                    "comfy"
+                    ], {"default": "sdpa"}),
             }
         }
 
@@ -641,7 +709,7 @@ class CogVideoXModelLoader:
 
     def loadmodel(self, model, base_precision, load_device, enable_sequential_cpu_offload, 
                   block_edit=None, compile_args=None, lora=None, attention_mode="sdpa", quantization="disabled"):
-        
+        transformer = None
         if "sage" in attention_mode:
             try:
                 from sageattention import sageattn
@@ -707,7 +775,7 @@ class CogVideoXModelLoader:
                     transformer_config["sample_width"] = 300
 
         with init_empty_weights():
-            transformer = CogVideoXTransformer3DModel.from_config(transformer_config)
+            transformer = CogVideoXTransformer3DModel.from_config(transformer_config, attention_mode=attention_mode)
 
         #load weights
         #params_to_keep = {}
@@ -1063,6 +1131,7 @@ NODE_CLASS_MAPPINGS = {
     "CogVideoLoraSelect": CogVideoLoraSelect,
     "CogVideoXVAELoader": CogVideoXVAELoader,
     "CogVideoXModelLoader": CogVideoXModelLoader,
+    "CogVideoLoraSelectComfy": CogVideoLoraSelectComfy
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadCogVideoModel": "(Down)load CogVideo Model",
@@ -1072,4 +1141,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CogVideoLoraSelect": "CogVideo LoraSelect",
     "CogVideoXVAELoader": "CogVideoX VAE Loader",
     "CogVideoXModelLoader": "CogVideoX Model Loader",
+    "CogVideoLoraSelectComfy": "CogVideo LoraSelect Comfy"
     }
