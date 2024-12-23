@@ -147,6 +147,7 @@ class DownloadAndLoadCogVideoModel:
                         "alibaba-pai/CogVideoX-Fun-V1.1-2b-Pose",
                         "alibaba-pai/CogVideoX-Fun-V1.1-5b-Pose",
                         "alibaba-pai/CogVideoX-Fun-V1.1-5b-Control",
+                        "alibaba-pai/CogVideoX-Fun-V1.5-5b-InP",
                         "feizhengcong/CogvideoX-Interpolation",
                         "NimVideo/cogvideox-2b-img2vid"
                     ],
@@ -217,7 +218,7 @@ class DownloadAndLoadCogVideoModel:
         if "Fun" in model:
             if os.path.exists(folder_paths.cache_dir):
                 download_path = os.path.join(folder_paths.cache_dir, "CogVideoX_Fun")
-            if not "1.1" in model:
+            if "1.1" not in model and "1.5" not in model:
                 repo_id = "kijai/CogVideoX-Fun-pruned"
                 if "2b" in model:
                     base_path = os.path.join(folder_paths.models_dir, "CogVideoX_Fun", "CogVideoX-Fun-2b-InP") # location of the official model
@@ -227,7 +228,7 @@ class DownloadAndLoadCogVideoModel:
                     base_path = os.path.join(folder_paths.models_dir, "CogVideoX_Fun", "CogVideoX-Fun-5b-InP") # location of the official model
                     if not os.path.exists(base_path):
                         base_path = os.path.join(download_path, "CogVideoX-Fun-5b-InP")
-            elif "1.1" in model:
+            else:
                 repo_id = model
                 base_path = os.path.join(folder_paths.models_dir, "CogVideoX_Fun", (model.split("/")[-1])) # location of the official model
                 if not os.path.exists(base_path):
@@ -286,7 +287,7 @@ class DownloadAndLoadCogVideoModel:
         transformer = CogVideoXTransformer3DModel.from_pretrained(base_path, subfolder=subfolder, attention_mode=attention_mode)
         transformer = transformer.to(dtype).to(transformer_load_device)
 
-        if "1.5" in model:
+        if "1.5" in model and not "fun" in model:
             transformer.config.sample_height = 300
             transformer.config.sample_width = 300
 

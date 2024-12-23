@@ -29,6 +29,7 @@ from diffusers.loaders import CogVideoXLoraLoaderMixin
 
 from .embeddings import get_3d_rotary_pos_embed
 from .custom_cogvideox_transformer_3d import CogVideoXTransformer3DModel
+from .enhance_a_video.globals import enable_enhance, disable_enhance, set_enhance_weight
 
 from comfy.utils import ProgressBar
 
@@ -351,6 +352,7 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
         tora: Optional[dict] = None,
         image_cond_start_percent: float = 0.0,
         image_cond_end_percent: float = 1.0,
+        feta_args: Optional[dict] = None,
         
     ):
         """
@@ -471,7 +473,9 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
 
         # 5.5.
         if image_cond_latents is not None:
-            if image_cond_latents.shape[1] == 2:
+            image_cond_frame_count = image_cond_latents.size(1)
+            patch_size_t = self.transformer.config.patch_size_t
+            if image_cond_frame_count == 2:
                 logger.info("More than one image conditioning frame received, interpolating")
                 padding_shape = (
                     batch_size,
@@ -482,12 +486,12 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 )
                 latent_padding = torch.zeros(padding_shape, device=device, dtype=self.vae_dtype)
                 image_cond_latents = torch.cat([image_cond_latents[:, 0, :, :, :].unsqueeze(1), latent_padding, image_cond_latents[:, -1, :, :, :].unsqueeze(1)], dim=1)
-                if self.transformer.config.patch_size_t is not None:
-                    first_frame = image_cond_latents[:, : image_cond_latents.size(1) % self.transformer.config.patch_size_t, ...]
+                if patch_size_t:
+                    first_frame = image_cond_latents[:, : image_cond_latents.size(1) % patch_size_t, ...]
                     image_cond_latents = torch.cat([first_frame, image_cond_latents], dim=1)
 
                 logger.info(f"image cond latents shape: {image_cond_latents.shape}")
-            elif image_cond_latents.shape[1] == 1:
+            elif image_cond_frame_count == 1:
                 logger.info("Only one image conditioning frame received, img2vid")
                 if self.input_with_padding:
                     padding_shape = (
@@ -500,13 +504,20 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                     latent_padding = torch.zeros(padding_shape, device=device, dtype=self.vae_dtype)
                     image_cond_latents = torch.cat([image_cond_latents, latent_padding], dim=1)
                     # Select the first frame along the second dimension
-                    if self.transformer.config.patch_size_t is not None:
-                        first_frame = image_cond_latents[:, : image_cond_latents.size(1) % self.transformer.config.patch_size_t, ...]
+                    if patch_size_t:
+                        first_frame = image_cond_latents[:, : image_cond_latents.size(1) % patch_size_t, ...]
                         image_cond_latents = torch.cat([first_frame, image_cond_latents], dim=1)
                 else:
                     image_cond_latents = image_cond_latents.repeat(1, latents.shape[1], 1, 1, 1)
             else:
                 logger.info(f"Received {image_cond_latents.shape[1]} image conditioning frames")
+                if fun_mask is not None and patch_size_t:
+                    logger.info(f"1.5 model received {fun_mask.shape[1]} masks")
+                    first_frame = image_cond_latents[:, : image_cond_frame_count % patch_size_t, ...]
+                    image_cond_latents = torch.cat([first_frame, image_cond_latents], dim=1)
+                    fun_mask_first_frame = fun_mask[:, : image_cond_frame_count % patch_size_t, ...]
+                    fun_mask = torch.cat([fun_mask_first_frame, fun_mask], dim=1)
+                    fun_mask[:, 1:, ...] = 0
             image_cond_latents = image_cond_latents.to(self.vae_dtype)
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
@@ -564,7 +575,7 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
         else:
             controlnet_states = None
             control_weights= None
-
+        # 9. Tora
         if tora is not None:
             trajectory_length = tora["video_flow_features"].shape[1]
             logger.info(f"Tora trajectory length: {trajectory_length}")
@@ -576,16 +587,32 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
 
         logger.info(f"Sampling {num_frames} frames in {latent_frames} latent frames at {width}x{height} with {num_inference_steps} inference steps")
 
+        if feta_args is not None:
+            set_enhance_weight(feta_args["weight"])
+            feta_start_percent = feta_args["start_percent"]
+            feta_end_percent = feta_args["end_percent"]
+            enable_enhance()
+        else:
+            disable_enhance()
+
+        # 11. Denoising loop
         from .latent_preview import prepare_callback
         callback = prepare_callback(self.transformer, num_inference_steps)
 
-        # 9. Denoising loop
         comfy_pbar = ProgressBar(len(timesteps))
         with self.progress_bar(total=len(timesteps)) as progress_bar:    
             old_pred_original_sample = None # for DPM-solver++
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
+
+                current_step_percentage = i / num_inference_steps
+
+                if feta_args is not None:
+                    if feta_start_percent <= current_step_percentage <= feta_end_percent:
+                        enable_enhance()
+                    else:
+                        disable_enhance()
                 # region context schedule sampling
                 if use_context_schedule:
                     latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
@@ -599,8 +626,6 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
 
                     # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                     timestep = t.expand(latent_model_input.shape[0])
-
-                    current_step_percentage = i / num_inference_steps
 
                     # use same rotary embeddings for all context windows
                     image_rotary_emb = (
@@ -710,8 +735,6 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 else:
                     latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
-                    current_step_percentage = i / num_inference_steps
 
                     if image_cond_latents is not None:
                         if not image_cond_start_percent <= current_step_percentage <= image_cond_end_percent:

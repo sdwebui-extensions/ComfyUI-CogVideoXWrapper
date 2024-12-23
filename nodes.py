@@ -52,6 +52,24 @@ if not "cogvideox_loras" in folder_paths.folder_names_and_paths:
 if os.path.exists(folder_paths.cache_dir):
     folder_paths.add_model_folder_path("CogVideo", os.path.join(folder_paths.cache_dir, "CogVideo"))
     folder_paths.add_model_folder_path("cogvideox_loras", os.path.join(folder_paths.cache_dir, "CogVideo", "loras"))
+class CogVideoEnhanceAVideo:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "weight": ("FLOAT", {"default": 1.0, "min": 0, "max": 100, "step": 0.01, "tooltip": "The feta Weight of the Enhance-A-Video"}),
+                "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Start percentage of the steps to apply Enhance-A-Video"}),
+                "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "End percentage of the steps to apply Enhance-A-Video"}),
+            },
+        }
+    RETURN_TYPES = ("FETAARGS",)
+    RETURN_NAMES = ("feta_args",)
+    FUNCTION = "setargs"
+    CATEGORY = "CogVideoWrapper"
+    DESCRIPTION = "https://github.com/NUS-HPC-AI-Lab/Enhance-A-Video"
+
+    def setargs(self, **kwargs):
+        return (kwargs, )
 
 class CogVideoContextOptions:
     @classmethod
@@ -364,8 +382,8 @@ class CogVideoImageEncodeFunInP:
         masked_image_latents = masked_image_latents.permute(0, 2, 1, 3, 4)  # B, T, C, H, W
 
         mask = torch.zeros_like(masked_image_latents[:, :, :1, :, :])
-        if end_image is not None:
-            mask[:, -1, :, :, :] = 0
+        #if end_image is not None:
+        #    mask[:, -1, :, :, :] = 0
         mask[:, 0, :, :, :] = vae_scaling_factor
 
         final_latents = masked_image_latents * vae_scaling_factor
@@ -596,6 +614,7 @@ class CogVideoSampler:
                 "controlnet": ("COGVIDECONTROLNET",),
                 "tora_trajectory": ("TORAFEATURES", ),
                 "fastercache": ("FASTERCACHEARGS", ),
+                "feta_args": ("FETAARGS", ),
             }
         }
 
@@ -605,7 +624,7 @@ class CogVideoSampler:
     CATEGORY = "CogVideoWrapper"
 
     def process(self, model, positive, negative, steps, cfg, seed, scheduler, num_frames, samples=None,
-                denoise_strength=1.0, image_cond_latents=None, context_options=None, controlnet=None, tora_trajectory=None, fastercache=None):
+                denoise_strength=1.0, image_cond_latents=None, context_options=None, controlnet=None, tora_trajectory=None, fastercache=None, feta_args=None):
         mm.unload_all_models()
         mm.soft_empty_cache()
 
@@ -627,7 +646,7 @@ class CogVideoSampler:
             image_conds = image_cond_latents["samples"]
             image_cond_start_percent = image_cond_latents.get("start_percent", 0.0)
             image_cond_end_percent = image_cond_latents.get("end_percent", 1.0)
-            if "1.5" in model_name or "1_5" in model_name:
+            if ("1.5" in model_name or "1_5" in model_name) and not "fun" in model_name.lower():
                 image_conds = image_conds / 0.7 # needed for 1.5 models
         else:
             if not "fun" in model_name.lower():
@@ -726,6 +745,7 @@ class CogVideoSampler:
                 tora=tora_trajectory if tora_trajectory is not None else None,
                 image_cond_start_percent=image_cond_start_percent if image_cond_latents is not None else 0.0,
                 image_cond_end_percent=image_cond_end_percent if image_cond_latents is not None else 1.0,
+                feta_args=feta_args,
             )
         if not model["cpu_offloading"] and model["manual_offloading"]:
             pipe.transformer.to(offload_device)
@@ -964,6 +984,7 @@ NODE_CLASS_MAPPINGS = {
     "CogVideoLatentPreview": CogVideoLatentPreview,
     "CogVideoXTorchCompileSettings": CogVideoXTorchCompileSettings,
     "CogVideoImageEncodeFunInP": CogVideoImageEncodeFunInP,
+    "CogVideoEnhanceAVideo": CogVideoEnhanceAVideo,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "CogVideoSampler": "CogVideo Sampler",
@@ -980,4 +1001,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CogVideoLatentPreview": "CogVideo LatentPreview",
     "CogVideoXTorchCompileSettings": "CogVideo TorchCompileSettings",
     "CogVideoImageEncodeFunInP": "CogVideo ImageEncode FunInP",
+    "CogVideoEnhanceAVideo": "CogVideo Enhance-A-Video",
     }
