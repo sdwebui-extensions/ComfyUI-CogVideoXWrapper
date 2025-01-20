@@ -982,6 +982,7 @@ class DownloadAndLoadToraModel:
                 "model": (
                     [
                         "kijai/CogVideoX-5b-Tora",
+                        "kijai/CogVideoX-5b-Tora-I2V",
                     ],
                 ),
             },
@@ -1013,14 +1014,16 @@ class DownloadAndLoadToraModel:
         download_path = os.path.join(folder_paths.models_dir, 'CogVideo', "CogVideoX-5b-Tora")
         if os.path.exists(folder_paths.cache_dir):
             download_path = os.path.join(folder_paths.cache_dir, 'CogVideo', "CogVideoX-5b-Tora")
-        fuser_path = os.path.join(download_path, "fuser", "fuser.safetensors")
+
+        fuser_model = "fuser.safetensors" if not "I2V" in model else "fuser_I2V.safetensors"
+        fuser_path = os.path.join(download_path, "fuser", fuser_model)
         if not os.path.exists(fuser_path):
             log.info(f"Downloading Fuser model to: {fuser_path}")
             from huggingface_hub import snapshot_download
 
             snapshot_download(
                 repo_id=model,
-                allow_patterns=["*fuser.safetensors*"],
+                allow_patterns=[fuser_model],
                 local_dir=download_path,
                 local_dir_use_symlinks=False,
             )
@@ -1042,14 +1045,15 @@ class DownloadAndLoadToraModel:
                     param.data = param.data.to(torch.bfloat16).to(device)
         del fuser_sd
 
-        traj_extractor_path = os.path.join(download_path, "traj_extractor", "traj_extractor.safetensors")
+        traj_extractor_model = "traj_extractor.safetensors" if not "I2V" in model else "traj_extractor_I2V.safetensors"
+        traj_extractor_path = os.path.join(download_path, "traj_extractor", traj_extractor_model)
         if not os.path.exists(traj_extractor_path):
             log.info(f"Downloading trajectory extractor model to: {traj_extractor_path}")
             from huggingface_hub import snapshot_download
 
             snapshot_download(
                 repo_id="kijai/CogVideoX-5b-Tora",
-                allow_patterns=["*traj_extractor.safetensors*"],
+                allow_patterns=[traj_extractor_model],
                 local_dir=download_path,
                 local_dir_use_symlinks=False,
             )

@@ -196,7 +196,7 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 noise[:, place_idx:place_idx + delta, :, :, :] = noise[:, list_idx, :, :, :]
         if latents is None:
             latents = noise.to(device)
-        else:
+        elif denoise_strength < 1.0:
             latents = latents.to(device)
             timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, denoise_strength, device)
             latent_timestep = timesteps[:1]
@@ -213,6 +213,8 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                 latents = latents[:, :frames_needed, :, :, :]
 
             latents = self.scheduler.add_noise(latents, noise.to(device), latent_timestep)
+        else:
+            latents = latents.to(device)
         latents = latents * self.scheduler.init_noise_sigma # scale the initial noise by the standard deviation required by the scheduler
         return latents, timesteps
 
@@ -814,7 +816,7 @@ class CogVideoXPipeline(DiffusionPipeline, CogVideoXLoraLoaderMixin):
                     if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                         progress_bar.update()
                         if callback is not None:
-                            callback(i, latents.detach()[-1], None, num_inference_steps)
+                            callback(i, (latents - noise_pred * (t / 1000)).detach()[0], None, num_inference_steps)
                         else:
                             comfy_pbar.update(1)
             
